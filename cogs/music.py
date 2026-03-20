@@ -20,6 +20,11 @@ class Music(commands.Cog):
         self.bot = bot
         self.spotify = SpotifyClient()
         self.librespot = LibrespotManager()
+        self._queue: list[dict] = []
+        self._current: dict | None = None
+        self._advance_task: asyncio.Task | None = None
+        self._channel: discord.TextChannel | None = None
+        self._started_at: float = 0  # loop.time() when track started
 
     async def cog_load(self):
         self.librespot.start()
@@ -46,7 +51,57 @@ class Music(commands.Cog):
         logger.info("VC接続: %s", channel.name)
         return vc
 
-    # ---- テスト用 (owner only) ----
+    # 再生とキュー管理
+
+    async def _play_track(self, track: dict):
+        await self.spotify.play(uri=track["uri"])
+        self.librespot.flush()
+        self._current = track
+        self._started_at = asyncio.get_event_loop().time()
+        self._set_advance_timer(track.get("duration_ms", 0) / 1000)
+
+    def _set_advance_timer(self, secs: float):
+        if self._advance_task:
+            self._advance_task.cancel()
+        if secs > 0:
+            self._advance_task = asyncio.create_task(self._advance_after(secs + 1))
+
+    async def _advance_after(self, secs: float):
+        try:
+            await asyncio.sleep(secs)
+            if self._queue:
+                track = self._queue.pop(0)
+                await self._play_track(track)
+                if self._channel:
+                    await self._channel.send(embed=now_playing_embed(track))
+            else:
+                self._current = None
+        except asyncio.CancelledError:
+            pass
+
+    def _remaining_secs(self) -> float:
+        if not self._current or not self._current.get("duration_ms"):
+            return 0
+        elapsed = asyncio.get_event_loop().time() - self._started_at
+        return max(0, self._current["duration_ms"] / 1000 - elapsed)
+
+    async def _play_or_queue(self, ctx, uri: str, track_info: dict | None = None):
+        info = track_info or await self.spotify.get_track(uri)
+        if not info:
+            info = {"uri": uri, "name": "不明", "artist": "", "album": "", "duration_ms": 0}
+        if "uri" not in info:
+            info["uri"] = uri
+
+        self._channel = ctx.channel
+
+        if self._current:
+            self._queue.append(info)
+            await ctx.send(f"🎵 キューに追加: **{info['name']}** - {info['artist']}")
+        else:
+            await self._play_track(info)
+            await ctx.send(embed=now_playing_embed(info))
+
+    # テスト用 (owner only)
 
     @commands.command(hidden=True)
     @commands.is_owner()
@@ -104,7 +159,7 @@ class Music(commands.Cog):
         vc.play(source)
         await ctx.send(f"▶ ファイル再生中 ({actual_secs:.1f}秒)")
 
-    # ---- コマンド ----
+    # コマンド
 
     @commands.command()
     async def join(self, ctx: commands.Context):
@@ -112,11 +167,16 @@ class Music(commands.Cog):
         await self._ensure_connected(ctx)
         await ctx.send("🔊 ボイスチャンネルに接続しました。")
 
-    @commands.command()
-    async def leave(self, ctx: commands.Context):
+    @commands.command(aliases=["leave"])
+    async def bye(self, ctx: commands.Context):
         """ボイスチャンネルから退出"""
         vc = self._get_vc(ctx)
         if vc and vc.is_connected():
+            await self.spotify.pause()
+            if self._advance_task:
+                self._advance_task.cancel()
+            self._queue.clear()
+            self._current = None
             vc.stop()
             await vc.disconnect()
             await ctx.send("👋 ボイスチャンネルから退出しました。")
@@ -132,8 +192,12 @@ class Music(commands.Cog):
         if parsed:
             kind, uri = parsed
 
-            # album / playlist → そのまま再生開始
+            # album / playlist
             if kind != "track":
+                if self._advance_task:
+                    self._advance_task.cancel()
+                self._queue.clear()
+                self._current = None
                 await self.spotify.play(context_uri=uri)
                 self.librespot.flush()
                 await asyncio.sleep(0.5)
@@ -144,45 +208,15 @@ class Music(commands.Cog):
                     await ctx.send("▶ 再生を開始しました。")
                 return
 
-            # track: 再生中ならキューに追加
-            current = await self.spotify.get_current_track()
-            if current and current.get("is_playing"):
-                await self.spotify.add_to_queue(uri=uri)
-                track_info = await self.spotify.get_track(uri)
-                if track_info:
-                    await ctx.send(
-                        f"🎵 キューに追加: **{track_info['name']}** - {track_info['artist']}"
-                    )
-                else:
-                    await ctx.send("🎵 キューに追加しました。")
-                return
-
-            await self.spotify.play(uri=uri)
-            self.librespot.flush()
-            await asyncio.sleep(0.5)
-            track = await self.spotify.get_current_track()
-            if track:
-                await ctx.send(embed=now_playing_embed(track))
-            else:
-                await ctx.send("▶ 再生を開始しました。")
+            await self._play_or_queue(ctx, uri)
             return
 
-        # テキスト検索
         results = await self.spotify.search_tracks(query, limit=1)
         if not results:
             await ctx.send("曲が見つかりませんでした。")
             return
 
-        track = results[0]
-        current = await self.spotify.get_current_track()
-        if current and current.get("is_playing"):
-            await self.spotify.add_to_queue(uri=track["uri"])
-            await ctx.send(f"🎵 キューに追加: **{track['name']}** - {track['artist']}")
-            return
-
-        await self.spotify.play(uri=track["uri"])
-        self.librespot.flush()
-        await ctx.send(embed=now_playing_embed(track))
+        await self._play_or_queue(ctx, results[0]["uri"], results[0])
 
     @commands.command()
     async def search(self, ctx: commands.Context, *, query: str):
@@ -216,65 +250,61 @@ class Music(commands.Cog):
         selected = results[idx]
 
         await self._ensure_connected(ctx)
-
-        current = await self.spotify.get_current_track()
-        if current and current.get("is_playing"):
-            await self.spotify.add_to_queue(uri=selected["uri"])
-            await ctx.send(
-                f"🎵 キューに追加: **{selected['name']}** - {selected['artist']}"
-            )
-        else:
-            await self.spotify.play(uri=selected["uri"])
-            self.librespot.flush()
-            await ctx.send(embed=now_playing_embed(selected))
+        await self._play_or_queue(ctx, selected["uri"], selected)
 
     @commands.command()
     async def pause(self, ctx: commands.Context):
         """一時停止"""
         await self.spotify.pause()
+        self.librespot.flush()
+        if self._advance_task:
+            self._advance_task.cancel()
         await ctx.send("⏸ 一時停止しました。")
 
     @commands.command()
     async def resume(self, ctx: commands.Context):
         """再生を再開"""
         await self.spotify.resume()
+        remaining = self._remaining_secs()
+        if remaining > 0:
+            self._started_at = asyncio.get_event_loop().time() - (self._current["duration_ms"] / 1000 - remaining)
+            self._set_advance_timer(remaining)
         await ctx.send("▶ 再生を再開しました。")
 
     @commands.command(aliases=["next"])
     async def skip(self, ctx: commands.Context):
         """次の曲へスキップ"""
-        await self.spotify.skip()
-        self.librespot.flush()
-        await asyncio.sleep(1)
-        track = await self.spotify.get_current_track()
-        if track:
-            await ctx.send(embed=now_playing_embed(track))
-        else:
-            await ctx.send("⏭ スキップしました。")
+        if not self._queue:
+            await ctx.send("キューに次の曲がありません。")
+            return
+
+        if self._advance_task:
+            self._advance_task.cancel()
+
+        track = self._queue.pop(0)
+        await self._play_track(track)
+        await ctx.send(embed=now_playing_embed(track))
 
     @commands.command()
     async def stop(self, ctx: commands.Context):
-        """再生停止 & VC 退出"""
+        """再生停止（キュー保持）"""
         await self.spotify.pause()
-        vc = self._get_vc(ctx)
-        if vc and vc.is_connected():
-            vc.stop()
-            await vc.disconnect()
+        self.librespot.flush()
+        if self._advance_task:
+            self._advance_task.cancel()
         await ctx.send("⏹ 再生を停止しました。")
 
     @commands.command(aliases=["q"])
     async def queue(self, ctx: commands.Context):
         """再生キューを表示"""
-        data = await self.spotify.get_queue()
-        embed = queue_embed(data["queue"], data["current"], data["total"])
+        embed = queue_embed(self._queue, self._current, len(self._queue))
         await ctx.send(embed=embed)
 
     @commands.command(aliases=["nowplaying"])
     async def np(self, ctx: commands.Context):
         """再生中の曲情報を表示"""
-        track = await self.spotify.get_current_track()
-        if track:
-            await ctx.send(embed=now_playing_embed(track))
+        if self._current:
+            await ctx.send(embed=now_playing_embed(self._current))
         else:
             await ctx.send("現在再生中の曲はありません。")
 

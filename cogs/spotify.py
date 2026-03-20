@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 
 
 class SpotifyClient:
-    """Spotify Web API ラッパー"""
 
     SCOPES = (
         "user-modify-playback-state "
@@ -50,7 +49,6 @@ class SpotifyClient:
 
     @staticmethod
     def parse_spotify_uri(query: str) -> tuple[str, str] | None:
-        """URL/URI → (type, uri)。該当しなければ None"""
         m = re.match(
             r"https?://open\.spotify\.com/(track|album|playlist)/([a-zA-Z0-9]+)",
             query,
@@ -65,7 +63,7 @@ class SpotifyClient:
 
     @staticmethod
     def _simplify_track(item: dict) -> dict:
-        # エピソード (podcast) は artists/album がないので fallback
+        # podcast episode は artists/album がない
         images = item.get("album", {}).get("images", []) or item.get("images", [])
         artists = item.get("artists")
         if artists:
@@ -80,8 +78,6 @@ class SpotifyClient:
             "duration_ms": item.get("duration_ms", 0),
             "image_url": images[0]["url"] if images else None,
         }
-
-    # -- public --
 
     async def search_tracks(self, query: str, limit: int = 5) -> list[dict]:
         results = await self._run(self.sp.search, q=query, type="track", limit=limit)

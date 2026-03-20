@@ -35,7 +35,7 @@ class SpotifyHelpCommand(commands.HelpCommand):
                 ("`!pause`", "一時停止"),
                 ("`!resume`", "再生を再開"),
                 ("`!skip` / `!next`", "次の曲へスキップ"),
-                ("`!stop`", "再生停止 & VC 退出"),
+                ("`!stop`", "再生停止"),
             ],
             "情報": [
                 ("`!np` / `!nowplaying`", "再生中の曲を表示（ジャケ写付き）"),
@@ -44,7 +44,7 @@ class SpotifyHelpCommand(commands.HelpCommand):
             ],
             "接続": [
                 ("`!join`", "ボイスチャンネルに参加"),
-                ("`!leave`", "ボイスチャンネルから退出"),
+                ("`!bye` / `!leave`", "ボイスチャンネルから退出"),
             ],
             "デバイス": [
                 ("`!device`", "Spotify デバイス一覧を表示"),

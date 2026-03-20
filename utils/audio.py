@@ -3,7 +3,6 @@ import logging
 import os
 import subprocess
 import threading
-import time
 
 import discord
 
@@ -15,8 +14,8 @@ F_SETPIPE_SZ = 1031
 BYTES_PER_SEC_48K = 48000 * 2 * 2
 
 
+# 追記されるファイルからリアルタイムに読む AudioSource
 class GrowingFileSource(discord.AudioSource):
-    """追記されるファイルからリアルタイムに読むオーディオソース"""
 
     FRAME_SIZE = 3840  # 20ms @ 48kHz stereo 16-bit
     SILENCE = b"\x00" * FRAME_SIZE
@@ -60,8 +59,8 @@ class GrowingFileSource(discord.AudioSource):
                            self._underruns, self._pos / BYTES_PER_SEC_48K)
         return self.SILENCE
 
+    # ファイル末尾にジャンプ（曲変更時のバッファスキップ用）
     def flush(self):
-        """ファイル末尾にジャンプ（曲変更時のバッファスキップ用）"""
         with self._lock:
             if self._file:
                 self._file.seek(0, 2)
@@ -70,19 +69,12 @@ class GrowingFileSource(discord.AudioSource):
                 logger.info("flush: skipped %.1fs",
                             (self._pos - old_pos) / BYTES_PER_SEC_48K)
 
+    # compaction 後にファイル再オープン (lock 保持中に呼ぶ)
     def _reopen(self):
-        """compaction 後にファイル再オープン（lock 保持中に呼ぶ）"""
         if self._file:
             self._file.close()
         self._file = open(self._path, "rb")
         self._pos = 0
-
-    def reset(self):
-        with self._lock:
-            if self._file:
-                self._file.close()
-            self._file = None
-            self._pos = 0
 
     def cleanup(self):
         if self._file:
@@ -96,13 +88,11 @@ class GrowingFileSource(discord.AudioSource):
         return False
 
 
+# librespot プロセス管理 + ファイル経由で discord.py に音声供給
 class LibrespotManager:
-    """librespot プロセス管理 + ファイル経由で discord.py に音声供給"""
 
     AUDIO_FILE = "/tmp/librespot_audio.pcm"
     COMPACT_THRESHOLD = BYTES_PER_SEC_48K * 120  # 2分消費後に compaction
-    MAX_RESTART_ATTEMPTS = 5
-    RESTART_BACKOFF_BASE = 5  # sec
 
     def __init__(self):
         self.librespot_proc: subprocess.Popen | None = None
@@ -111,18 +101,11 @@ class LibrespotManager:
         self._writer_thread: threading.Thread | None = None
         self._file_ready = threading.Event()
         self._source: GrowingFileSource | None = None
-        self._restart_count = 0
 
     def start(self):
         if self._running:
             return
-        self._running = True
-        self._start_librespot()
-        self._start_writer()
-        threading.Thread(target=self._monitor_process, daemon=True).start()
-        logger.info("librespot ready")
 
-    def _start_librespot(self):
         device_name = os.getenv("LIBRESPOT_DEVICE_NAME", "Discord Bot")
         bitrate = os.getenv("LIBRESPOT_BITRATE", "320")
         cache_dir = os.getenv("LIBRESPOT_CACHE", "/app/cache")
@@ -138,7 +121,7 @@ class LibrespotManager:
             "--system-cache", cache_dir,
             "--disable-discovery",
             "--dither", "none",
-            "--volume-ctrl", "linear",
+            "--volume-ctrl", "fixed",
         ]
 
         logger.info("librespot 起動: %s", device_name)
@@ -152,10 +135,13 @@ class LibrespotManager:
         except OSError as e:
             logger.warning("pipe buffer resize failed: %s", e)
 
+        self._running = True
         threading.Thread(target=self._log_stderr, daemon=True).start()
+        self._start_writer()
+        logger.info("librespot ready")
 
+    # librespot stdout → ffmpeg (44.1k→48k) → file
     def _start_writer(self):
-        """librespot stdout → ffmpeg (44.1k→48k resample) → file"""
         try:
             os.remove(self.AUDIO_FILE)
         except FileNotFoundError:
@@ -197,7 +183,7 @@ class LibrespotManager:
                 if not self._file_ready.is_set() \
                         and bytes_written >= GrowingFileSource.PREFILL_BYTES:
                     self._file_ready.set()
-                    logger.info("audio file ready (%.1fs buffered)",
+                    logger.info("audio ready (%.1fs buffered)",
                                 bytes_written / BYTES_PER_SEC_48K)
 
                 # 定期 compaction
@@ -208,7 +194,7 @@ class LibrespotManager:
                         bytes_written = self._compact(f, source)
                         last_compact_check = bytes_written
 
-        logger.info("writer stopped (total %.1fs)", bytes_written / BYTES_PER_SEC_48K)
+        logger.info("writer stopped (%.1fs total)", bytes_written / BYTES_PER_SEC_48K)
 
     def _compact(self, writer_file, source: GrowingFileSource) -> int:
         with source._lock:
@@ -243,60 +229,11 @@ class LibrespotManager:
     def create_audio_source(self) -> discord.AudioSource:
         source = GrowingFileSource(self.AUDIO_FILE, self._file_ready)
         self._source = source
-        # 既存データをスキップ
-        try:
-            source._pos = os.path.getsize(self.AUDIO_FILE)
-        except FileNotFoundError:
-            pass
         return source
 
     def flush(self):
         if self._source:
             self._source.flush()
-
-    def _monitor_process(self):
-        while self._running:
-            time.sleep(5)
-            if self.librespot_proc and self.librespot_proc.poll() is not None:
-                self._restart_count += 1
-                if self._restart_count > self.MAX_RESTART_ATTEMPTS:
-                    logger.critical(
-                        "librespot が %d 回クラッシュ、自動再起動を停止",
-                        self.MAX_RESTART_ATTEMPTS,
-                    )
-                    return
-                backoff = self.RESTART_BACKOFF_BASE * self._restart_count
-                logger.error(
-                    "librespot crashed (exit %d, attempt %d/%d), retry in %ds",
-                    self.librespot_proc.returncode,
-                    self._restart_count,
-                    self.MAX_RESTART_ATTEMPTS,
-                    backoff,
-                )
-                time.sleep(backoff)
-                if not self._running:
-                    return
-                self._restart()
-            else:
-                self._restart_count = 0
-
-    def _restart(self):
-        if self._writer_ffmpeg:
-            try:
-                self._writer_ffmpeg.kill()
-                self._writer_ffmpeg.wait(timeout=5)
-            except Exception:
-                pass
-        if self._writer_thread and self._writer_thread.is_alive():
-            self._writer_thread.join(timeout=5)
-
-        self._start_librespot()
-        self._start_writer()
-
-        if self._source:
-            self._source.reset()
-
-        logger.info("librespot restarted")
 
     def _log_stderr(self):
         if self.librespot_proc and self.librespot_proc.stderr:
