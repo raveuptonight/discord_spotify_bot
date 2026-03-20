@@ -86,7 +86,7 @@ docker compose up -d
 ## 注意事項
 
 - **Spotify Premium が必須です。** Free プランでは再生制御 API が使えません。
-- このBotは [Librespot](https://github.com/librespot-org/librespot)（非公式 Spotify Connect クライアント）を使用しています。Spotify の利用規約に抵触する可能性があるため、**利用は自己責任**でお願いします。
+- 個人のサーバーで Premium 契約者が自分用に使うことを想定しています。不特定多数への公開利用は避けてください。
 - 1つの Spotify アカウントで同時に再生できるデバイスは1つだけです。Bot が再生中に別デバイスで再生すると切り替わります。
 
 ## ライセンス
