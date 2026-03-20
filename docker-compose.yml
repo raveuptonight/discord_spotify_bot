@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    network_mode: host
+    volumes:
+      - librespot-cache:/app/cache
+      - spotipy-cache:/app/token
+    environment:
+      - LIBRESPOT_CACHE=/app/cache
+      - SPOTIPY_CACHE_PATH=/app/token/.spotify_cache
+
+volumes:
+  librespot-cache:
+  spotipy-cache:
